@@ -130,16 +130,23 @@ def backtest_strategy(
         fee_rate: float = 0.001,  # 0.1% per side (spot typical)
         starting_cash: float = 10_000.0,
         strategy: Optional[LongTrailingStrategyBacktest] = None,
+        dca_step_pct: float = 0.05,
+        dca_max_adds: int = 0,
 ) -> Dict[str, Any]:
     """
-    Simple long-only backtest:
+    Simple long-only backtest with optional position averaging (DCA):
       - Enters at next candle open when signal true.
-      - Trailing stop (with optional activation offset) + stoploss.
-      - One position at a time, all-in position sizing.
-      - Uses daily bars; stop/TSL execution assumed at stop level if within day's range.
+      - Optional DCA: buy one equal tranche on every dca_step_pct drop from last fill price (intrabar),
+        up to dca_max_adds additional fills. Tranche size is cash available at entry divided by (dca_max_adds+1).
+      - Trailing stop (with optional activation offset) + hard stoploss.
+      - One position at a time.
+      - Uses bar data; stop/TSL execution assumed at stop level if within bar's range.
     """
     if strategy is None:
         strategy = LongTrailingStrategyBacktest()
+
+    # Ensure numeric
+    cash = float(starting_cash)
 
     df = strategy.populate_indicators(df)
     df = strategy.populate_entry_trend(df)
@@ -147,14 +154,22 @@ def backtest_strategy(
     # We will enter at next bar open, so we need shift of enter signal
     df["enter_next"] = df["enter_long"].shift(1).fillna(False)
 
-    cash = starting_cash
     position_size = 0.0
-    entry_price = None
+    entry_price = None  # this will represent the current average entry price
     max_price_since_entry = None
     trailing_active = False
 
     stoploss_level = None
     trail_level = None
+
+    # DCA state
+    tranche_cash = 0.0
+    dca_adds_done = 0
+    last_fill_price = None
+    next_add_price = None
+    total_buy_fees = 0.0
+    total_spent_cash = 0.0  # includes buy fees
+    net_invested = 0.0      # excludes buy fees
 
     trades: List[Dict[str, Any]] = []
 
@@ -167,11 +182,8 @@ def backtest_strategy(
         date = df.index[i]
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
 
-        # Update equity
-        if position_size > 0:
-            equity_curve.append(position_size * c)
-        else:
-            equity_curve.append(cash)
+        # Update equity (cash + position value)
+        equity_curve.append(cash + (position_size * c))
 
         # If in position, manage stoploss/trailing
         if position_size > 0:
@@ -183,19 +195,22 @@ def backtest_strategy(
                 if strategy.trailing_only_offset_is_reached:
                     # Activate trailing when profit >= offset
                     if not trailing_active:
-                        if (
-                                max_price_since_entry - entry_price) / entry_price >= strategy.trailing_stop_positive_offset:
+                        if (max_price_since_entry - entry_price) / entry_price >= strategy.trailing_stop_positive_offset:
                             trailing_active = True
                     if trailing_active:
-                        trail_level = max(trail_level or 0.0,
-                                          max_price_since_entry * (1.0 - strategy.trailing_stop_positive))
+                        trail_level = max(
+                            trail_level or 0.0,
+                            max_price_since_entry * (1.0 - strategy.trailing_stop_positive),
+                        )
                 else:
                     # Trailing always active
                     trailing_active = True
-                    trail_level = max(trail_level or 0.0,
-                                      max_price_since_entry * (1.0 - strategy.trailing_stop_positive))
+                    trail_level = max(
+                        trail_level or 0.0,
+                        max_price_since_entry * (1.0 - strategy.trailing_stop_positive),
+                    )
 
-            # Compute stop levels
+            # Compute stop levels based on average entry price
             stoploss_level = entry_price * (1.0 + strategy.stoploss)  # negative stoploss e.g. -0.9 -> 10% of entry
             effective_stop = stoploss_level
             if trailing_active and trail_level is not None:
@@ -215,58 +230,117 @@ def backtest_strategy(
                 # Sell entire position; deduct fee on selling
                 gross_value = position_size * exit_price
                 sell_fee = gross_value * fee_rate
-                cash = gross_value - sell_fee
+                cash = cash + gross_value - sell_fee
                 # trade record
                 trades[-1]["exit_time"] = date
                 trades[-1]["exit_price"] = exit_price
                 trades[-1]["exit_reason"] = exit_reason
                 trades[-1]["sell_fee"] = sell_fee
                 trades[-1]["pnl"] = cash - trades[-1]["cash_before_entry"]
-                trades[-1]["return_pct"] = (exit_price / trades[-1]["entry_price"] - 1.0) * 100.0 - (
-                            fee_rate * 100.0) - (fee_rate * 100.0)
+                spent = trades[-1].get("total_spent_cash", total_spent_cash)
+                trades[-1]["return_pct"] = (trades[-1]["pnl"] / spent * 100.0) if spent > 0 else 0.0
 
-                # Reset position
+                # Reset position & DCA state
                 position_size = 0.0
                 entry_price = None
                 max_price_since_entry = None
                 trailing_active = False
                 stoploss_level = None
                 trail_level = None
+                tranche_cash = 0.0
+                dca_adds_done = 0
+                last_fill_price = None
+                next_add_price = None
+                total_buy_fees = 0.0
+                total_spent_cash = 0.0
+                net_invested = 0.0
 
                 continue  # move to next bar
+
+            # If not exited, process DCA adds (intrabar) if enabled
+            if dca_max_adds > 0 and next_add_price is not None:
+                while dca_adds_done < dca_max_adds and cash > 0 and l <= next_add_price:
+                    # execute DCA buy at the grid price
+                    spend = min(tranche_cash, cash)
+                    if spend <= 0:
+                        break
+                    buy_fee = spend * fee_rate
+                    net_spend = spend - buy_fee
+                    add_price = next_add_price
+                    size_added = net_spend / add_price
+                    position_size += size_added
+                    net_invested += net_spend
+                    total_spent_cash += spend
+                    total_buy_fees += buy_fee
+                    cash -= spend
+
+                    # Sync trade record totals
+                    trades[-1]["total_spent_cash"] = total_spent_cash
+
+                    # Update average entry and next grid
+                    entry_price = net_invested / position_size
+                    dca_adds_done += 1
+                    last_fill_price = add_price
+                    next_add_price = last_fill_price * (1.0 - dca_step_pct)
+
+                    # Update trade record
+                    trades[-1]["buy_fee_total"] = trades[-1].get("buy_fee_total", 0.0) + buy_fee
+                    trades[-1]["dca_adds"] = dca_adds_done
+                    trades[-1]["entry_price"] = entry_price
 
         # If flat, consider entry at next candle open (we're at current candle close)
         if position_size == 0.0 and i + 1 < len(df):
             # If today's signal says enter on next bar
             if df.iloc[i + 1]["enter_next"]:
                 next_open = df.iloc[i + 1]["open"]
-                # Buy with all cash at next open minus fees
-                buy_cost = cash
-                buy_fee = buy_cost * fee_rate
-                net_cash_to_position = buy_cost - buy_fee
+                # Allocate tranche size for DCA (if enabled)
+                cash_before_entry_val = cash
+                if dca_max_adds > 0:
+                    tranche_cash = cash / float(dca_max_adds + 1)
+                else:
+                    tranche_cash = cash
+
+                # First buy at next open
+                spend = min(tranche_cash, cash)
+                buy_fee = spend * fee_rate
+                net_cash_to_position = spend - buy_fee
                 position_size = net_cash_to_position / next_open
-                entry_price = next_open
-                max_price_since_entry = entry_price
+                entry_price = next_open if position_size == 0 else (net_cash_to_position / position_size)
+                max_price_since_entry = next_open
                 trailing_active = False
                 stoploss_level = entry_price * (1.0 + strategy.stoploss)
                 trail_level = None
+
+                # Track investment stats
+                total_spent_cash = spend
+                total_buy_fees = buy_fee
+                net_invested = net_cash_to_position
+                cash -= spend
+
+                # Init DCA grid
+                dca_adds_done = 0
+                last_fill_price = next_open
+                next_add_price = last_fill_price * (1.0 - dca_step_pct) if dca_max_adds > 0 else None
 
                 # record trade
                 trades.append(
                     {
                         "entry_time": df.index[i + 1],
                         "entry_price": entry_price,
-                        "cash_before_entry": cash,
+                        "cash_before_entry": cash_before_entry_val,
                         "buy_fee": buy_fee,
+                        "buy_fee_total": buy_fee,
+                        "dca_adds": 0,
+                        "tranche_cash": tranche_cash,
                         "exit_time": None,
                         "exit_price": None,
                         "exit_reason": None,
                         "sell_fee": None,
                         "pnl": None,
                         "return_pct": None,
+                        "total_spent_cash": total_spent_cash,
                     }
                 )
-                cash = 0.0  # fully invested
 
     # If still in position at the end, close at last close
     if position_size > 0:
@@ -275,14 +349,14 @@ def backtest_strategy(
         exit_price = last_row["close"]
         gross_value = position_size * exit_price
         sell_fee = gross_value * fee_rate
-        cash = gross_value - sell_fee
+        cash = cash + gross_value - sell_fee
         trades[-1]["exit_time"] = last_date
         trades[-1]["exit_price"] = exit_price
         trades[-1]["exit_reason"] = "end_of_test"
         trades[-1]["sell_fee"] = sell_fee
         trades[-1]["pnl"] = cash - trades[-1]["cash_before_entry"]
-        trades[-1]["return_pct"] = (exit_price / trades[-1]["entry_price"] - 1.0) * 100.0 - (fee_rate * 100.0) - (
-                    fee_rate * 100.0)
+        spent = trades[-1].get("total_spent_cash", total_spent_cash)
+        trades[-1]["return_pct"] = (trades[-1]["pnl"] / spent * 100.0) if spent > 0 else 0.0
 
     # Final equity is cash (no open position)
     final_equity = cash
@@ -292,20 +366,20 @@ def backtest_strategy(
     max_dd = drawdown.min() if len(drawdown) else 0.0
 
     # KPI summary
-    total_return = (final_equity / starting_cash - 1.0) * 100.0
+    total_return = (final_equity / float(starting_cash) - 1.0) * 100.0
     days = (df.index[-1] - df.index[0]).days if len(df) > 1 else 1
     years = max(days / 365.25, 1e-9)
     # Compound Annual Growth Rate
-    cagr = ((final_equity / starting_cash) ** (1 / years) - 1.0) * 100.0 if final_equity > 0 else -100.0
+    cagr = ((final_equity / float(starting_cash)) ** (1 / years) - 1.0) * 100.0 if final_equity > 0 else -100.0
 
-    wins = sum(1 for t in trades if t["pnl"] is not None and t["pnl"] > 0)
-    losses = sum(1 for t in trades if t["pnl"] is not None and t["pnl"] <= 0)
+    wins = sum(1 for t in trades if t.get("pnl") is not None and t["pnl"] > 0)
+    losses = sum(1 for t in trades if t.get("pnl") is not None and t["pnl"] <= 0)
     win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
 
     result = {
         "trades": trades,
         "summary": {
-            "starting_cash": starting_cash,
+            "starting_cash": float(starting_cash),
             "final_equity": final_equity,
             "total_return_pct": total_return,
             "CAGR_pct": cagr,
@@ -333,7 +407,7 @@ def main():
     timeframe = input("Enter timeframe (default: 1d): ") or "1d"
     start_dt_str = input("Enter start date (YYYY-MM-DD, default: 2024-01-01): ") or "2024-01-01"
     end_dt_str = input("Enter end date (YYYY-MM-DD, default: 2025-01-01): ") or "2025-01-01"
-    starting_cash = input("Enter starting position size in USD (default: 1000): ") or "1000"
+    starting_cash = float(input("Enter starting position size in USD (default: 1000): ") or "1000")
     start_dt = datetime.strptime(start_dt_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end_dt = datetime.strptime(end_dt_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)  # exclusive end
     since_ms = int(start_dt.timestamp() * 1000)
@@ -367,6 +441,8 @@ def main():
         fee_rate=0.001,  # 0.1% per side
         starting_cash=starting_cash,
         strategy=strat,
+        dca_step_pct=0.05,
+        dca_max_adds=10,
     )
 
     # Output summary
