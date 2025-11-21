@@ -393,6 +393,330 @@ def backtest_strategy(
     return result
 
 
+class BearishShortStrategyBacktest:
+    """
+    Bearish market short strategy (mirror of long version):
+
+    Entry (enter_short):
+      - close < EMA200, EMA50, EMA20
+      - EMA200, EMA50, EMA20 strictly decreasing for the last 5 candles
+
+    Exit:
+      - Trailing stop with positive offset (for shorts: activates after sufficient profit, i.e., price drops)
+      - Hard stoploss (for shorts: price rising above a threshold)
+
+    Parameters are the same semantics as in LongTrailingStrategyBacktest.
+    """
+
+    def __init__(
+        self,
+        stoploss: float = -0.9,
+        trailing_stop: bool = True,
+        trailing_stop_positive: float = 0.1,
+        trailing_stop_positive_offset: float = 0.5,
+        trailing_only_offset_is_reached: bool = True,
+    ):
+        self.stoploss = stoploss
+        self.trailing_stop = trailing_stop
+        self.trailing_stop_positive = trailing_stop_positive
+        self.trailing_stop_positive_offset = trailing_stop_positive_offset
+        self.trailing_only_offset_is_reached = trailing_only_offset_is_reached
+
+    @staticmethod
+    def ema(series: pd.Series, period: int) -> pd.Series:
+        return series.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def strictly_decreasing_last_n(series: pd.Series, n: int) -> pd.Series:
+        """
+        Returns True at index i if series[i] < series[i-1] < ... < series[i-(n-1)]
+        """
+        cond = pd.Series(True, index=series.index)
+        for k in range(1, n):
+            cond &= series.shift(k - 1) < series.shift(k)
+        return cond.fillna(False)
+
+    def populate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["ema20"] = self.ema(df["close"], 20)
+        df["ema50"] = self.ema(df["close"], 50)
+        df["ema200"] = self.ema(df["close"], 200)
+
+        df["ema20_down_5"] = self.strictly_decreasing_last_n(df["ema20"], 5)
+        df["ema50_down_5"] = self.strictly_decreasing_last_n(df["ema50"], 5)
+        df["ema200_down_5"] = self.strictly_decreasing_last_n(df["ema200"], 5)
+        return df
+
+    def populate_entry_trend(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["enter_short"] = (
+            (df["close"] < df["ema200"]) &
+            (df["close"] < df["ema50"]) &
+            (df["close"] < df["ema20"]) &
+            (df["ema200_down_5"]) &
+            (df["ema50_down_5"]) &
+            (df["ema20_down_5"]) 
+        )
+        return df
+
+
+def backtest_short_strategy(
+    df: pd.DataFrame,
+    fee_rate: float = 0.001,
+    starting_cash: float = 10_000.0,
+    strategy: Optional[BearishShortStrategyBacktest] = None,
+    dca_step_pct: float = 0.05,
+    dca_max_adds: int = 0,
+) -> Dict[str, Any]:
+    """
+    Simple short-only backtest with optional position averaging on adverse moves (DCA adds when price rises):
+      - Enters at next candle open when signal true.
+      - DCA: allocate equal tranches of margin; each add increases size at higher prices.
+      - Trailing stop for shorts (trail above the lowest price reached after activation).
+      - Hard stoploss for shorts (price rising sufficiently above entry).
+      - One position at a time. Uses bar data with stop execution at stop level if within the bar.
+    """
+    if strategy is None:
+        strategy = BearishShortStrategyBacktest()
+
+    cash = float(starting_cash)
+
+    df = strategy.populate_indicators(df)
+    df = strategy.populate_entry_trend(df)
+    df["enter_next"] = df.get("enter_short", False).shift(1).fillna(False)
+
+    position_size = 0.0  # in asset units, positive number representing shorted amount
+    entry_price = None
+    min_price_since_entry = None
+    trailing_active = False
+
+    # For shorts, stoploss above entry; with stoploss negative, use (1 - stoploss)
+    stoploss_level = None
+    trail_level = None  # for shorts: trail price above min_price_since_entry
+
+    # DCA state
+    tranche_cash = 0.0
+    dca_adds_done = 0
+    last_fill_price = None
+    next_add_price = None
+    total_open_fees = 0.0
+    total_reserved_margin = 0.0
+    net_invested_margin = 0.0
+
+    trades: List[Dict[str, Any]] = []
+    equity_curve: List[float] = []
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        date = df.index[i]
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+
+        # Unrealized PnL for short if in position
+        unrealized = 0.0
+        if position_size > 0 and entry_price is not None:
+            unrealized = position_size * (entry_price - c)
+        # Equity = free cash + reserved margin + unrealized PnL
+        equity_curve.append(cash + total_reserved_margin + unrealized)
+
+        if position_size > 0:
+            # Update min price since entry
+            min_price_since_entry = min(min_price_since_entry, l)
+
+            # Trailing activation and level (for shorts)
+            if strategy.trailing_stop:
+                if strategy.trailing_only_offset_is_reached:
+                    if not trailing_active:
+                        if (entry_price - min_price_since_entry) / entry_price >= strategy.trailing_stop_positive_offset:
+                            trailing_active = True
+                    if trailing_active:
+                        trail_level = min(
+                            trail_level if trail_level is not None else float('inf'),
+                            min_price_since_entry * (1.0 + strategy.trailing_stop_positive),
+                        )
+                else:
+                    trailing_active = True
+                    trail_level = min(
+                        trail_level if trail_level is not None else float('inf'),
+                        min_price_since_entry * (1.0 + strategy.trailing_stop_positive),
+                    )
+
+            # Compute hard stop (for shorts: above entry)
+            stoploss_level = entry_price * (1.0 - strategy.stoploss)  # with negative stoploss, e.g. -0.9 -> 1.9x entry
+            effective_stop = stoploss_level
+            if trailing_active and trail_level is not None:
+                # For shorts, stop should be the minimum of (higher price is worse)
+                effective_stop = min(effective_stop, trail_level)
+
+            exit_reason = None
+            exit_price = None
+
+            # If today's high breaches the effective stop, exit at stop level
+            if l <= effective_stop <= h:
+                exit_price = effective_stop
+                exit_reason = "trailing_stop" if trailing_active and effective_stop == trail_level else "stoploss"
+
+            if exit_price is not None:
+                # Close the short: PnL = size * (avg_entry - exit)
+                pnl = position_size * (entry_price - exit_price)
+                gross_cover = position_size * exit_price
+                close_fee = gross_cover * fee_rate
+
+                cash = cash + total_reserved_margin + pnl - close_fee
+
+                trades[-1]["exit_time"] = date
+                trades[-1]["exit_price"] = exit_price
+                trades[-1]["exit_reason"] = exit_reason
+                trades[-1]["close_fee"] = close_fee
+                trades[-1]["pnl"] = cash - trades[-1]["cash_before_entry"]
+                spent = trades[-1].get("total_reserved_margin", total_reserved_margin)
+                trades[-1]["return_pct"] = (trades[-1]["pnl"] / spent * 100.0) if spent > 0 else 0.0
+
+                # Reset state
+                position_size = 0.0
+                entry_price = None
+                min_price_since_entry = None
+                trailing_active = False
+                stoploss_level = None
+                trail_level = None
+                tranche_cash = 0.0
+                dca_adds_done = 0
+                last_fill_price = None
+                next_add_price = None
+                total_open_fees = 0.0
+                total_reserved_margin = 0.0
+                net_invested_margin = 0.0
+                continue
+
+            # Process DCA adds on adverse move up
+            if dca_max_adds > 0 and next_add_price is not None:
+                while dca_adds_done < dca_max_adds and cash > 0 and h >= next_add_price:
+                    spend = min(tranche_cash, cash)
+                    if spend <= 0:
+                        break
+                    open_fee = spend * fee_rate
+                    net_margin = spend - open_fee
+                    add_price = next_add_price
+                    size_added = net_margin / add_price
+                    position_size += size_added
+                    net_invested_margin += net_margin
+                    total_reserved_margin += spend
+                    total_open_fees += open_fee
+                    cash -= spend
+
+                    trades[-1]["total_reserved_margin"] = total_reserved_margin
+
+                    # Update average entry (by size weighting)
+                    entry_price = net_invested_margin / position_size
+                    dca_adds_done += 1
+                    last_fill_price = add_price
+                    next_add_price = last_fill_price * (1.0 + dca_step_pct)
+
+                    trades[-1]["open_fee_total"] = trades[-1].get("open_fee_total", 0.0) + open_fee
+                    trades[-1]["dca_adds"] = dca_adds_done
+                    trades[-1]["entry_price"] = entry_price
+
+        # If flat, consider next bar entry
+        if position_size == 0.0 and i + 1 < len(df):
+            if df.iloc[i + 1]["enter_next"]:
+                next_open = df.iloc[i + 1]["open"]
+
+                cash_before_entry_val = cash
+                if dca_max_adds > 0:
+                    tranche_cash = cash / float(dca_max_adds + 1)
+                else:
+                    tranche_cash = cash
+
+                # Open initial short using tranche_cash as margin
+                spend = min(tranche_cash, cash)
+                open_fee = spend * fee_rate
+                net_margin = spend - open_fee
+
+                size = net_margin / next_open
+                position_size = size
+                entry_price = next_open if position_size == 0 else (net_margin / position_size)
+                min_price_since_entry = next_open
+                trailing_active = False
+                stoploss_level = entry_price * (1.0 - strategy.stoploss)
+                trail_level = None
+
+                total_reserved_margin = spend
+                total_open_fees = open_fee
+                net_invested_margin = net_margin
+                cash -= spend
+
+                dca_adds_done = 0
+                last_fill_price = next_open
+                next_add_price = last_fill_price * (1.0 + dca_step_pct) if dca_max_adds > 0 else None
+
+                trades.append(
+                    {
+                        "entry_time": df.index[i + 1],
+                        "entry_price": entry_price,
+                        "cash_before_entry": cash_before_entry_val,
+                        "open_fee": open_fee,
+                        "open_fee_total": open_fee,
+                        "dca_adds": 0,
+                        "tranche_cash": tranche_cash,
+                        "exit_time": None,
+                        "exit_price": None,
+                        "exit_reason": None,
+                        "close_fee": None,
+                        "pnl": None,
+                        "return_pct": None,
+                        "total_reserved_margin": total_reserved_margin,
+                    }
+                )
+
+    # Close at end if open: buy to cover at last close
+    if position_size > 0:
+        last_row = df.iloc[-1]
+        last_date = df.index[-1]
+        exit_price = last_row["close"]
+        pnl = position_size * (entry_price - exit_price)
+        gross_cover = position_size * exit_price
+        close_fee = gross_cover * fee_rate
+        cash = cash + total_reserved_margin + pnl - close_fee
+
+        trades[-1]["exit_time"] = last_date
+        trades[-1]["exit_price"] = exit_price
+        trades[-1]["exit_reason"] = "end_of_test"
+        trades[-1]["close_fee"] = close_fee
+        trades[-1]["pnl"] = cash - trades[-1]["cash_before_entry"]
+        spent = trades[-1].get("total_reserved_margin", total_reserved_margin)
+        trades[-1]["return_pct"] = (trades[-1]["pnl"] / spent * 100.0) if spent > 0 else 0.0
+
+    final_equity = cash
+    equity_series = pd.Series(equity_curve, index=df.index)
+    peak = equity_series.cummax()
+    drawdown = (equity_series - peak) / peak
+    max_dd = drawdown.min() if len(drawdown) else 0.0
+
+    total_return = (final_equity / float(starting_cash) - 1.0) * 100.0
+    days = (df.index[-1] - df.index[0]).days if len(df) > 1 else 1
+    years = max(days / 365.25, 1e-9)
+    cagr = ((final_equity / float(starting_cash)) ** (1 / years) - 1.0) * 100.0 if final_equity > 0 else -100.0
+
+    wins = sum(1 for t in trades if t.get("pnl") is not None and t["pnl"] > 0)
+    losses = sum(1 for t in trades if t.get("pnl") is not None and t["pnl"] <= 0)
+    win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
+
+    result = {
+        "trades": trades,
+        "summary": {
+            "starting_cash": float(starting_cash),
+            "final_equity": final_equity,
+            "total_return_pct": total_return,
+            "CAGR_pct": cagr,
+            "num_trades": len(trades),
+            "win_rate_pct": win_rate,
+            "max_drawdown_pct": max_dd * 100.0,
+            "fee_rate_per_side": fee_rate,
+        },
+        "equity_curve": equity_series,
+    }
+    return result
+
+
 def prepare_data_with_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure data has the required columns and clean NaNs from long EMAs (e.g., ema200 warm-up).
@@ -405,6 +729,7 @@ EXCHANGE_NAME = "bybit"
 def main():
     symbol = input("Enter symbol (default: BTC/USDT): ") or "BTC/USDT"
     timeframe = input("Enter timeframe (default: 1d): ") or "1d"
+    market_mode = (input("Market mode: bullish or bearish? (default: bullish): ") or "bullish").strip().lower()
     start_dt_str = input("Enter start date (YYYY-MM-DD, default: 2024-01-01): ") or "2024-01-01"
     end_dt_str = input("Enter end date (YYYY-MM-DD, default: 2025-01-01): ") or "2025-01-01"
     starting_cash = float(input("Enter starting position size in USD (default: 1000): ") or "1000")
@@ -429,21 +754,38 @@ def main():
 
     # Run backtest
     print("Running backtest...")
-    strat = LongTrailingStrategyBacktest(
-        stoploss=-0.9,
-        trailing_stop=True,
-        trailing_stop_positive=0.1,
-        trailing_stop_positive_offset=0.5,
-        trailing_only_offset_is_reached=True,  # activates trailing after +50% profit
-    )
-    result = backtest_strategy(
-        df=df,
-        fee_rate=0.001,  # 0.1% per side
-        starting_cash=starting_cash,
-        strategy=strat,
-        dca_step_pct=0.05,
-        dca_max_adds=10,
-    )
+    if market_mode == "bearish":
+        strat = BearishShortStrategyBacktest(
+            stoploss=-0.9,
+            trailing_stop=True,
+            trailing_stop_positive=0.1,
+            trailing_stop_positive_offset=0.5,
+            trailing_only_offset_is_reached=True,
+        )
+        result = backtest_short_strategy(
+            df=df,
+            fee_rate=0.001,
+            starting_cash=starting_cash,
+            strategy=strat,
+            dca_step_pct=0.05,
+            dca_max_adds=10,
+        )
+    else:
+        strat = LongTrailingStrategyBacktest(
+            stoploss=-0.9,
+            trailing_stop=True,
+            trailing_stop_positive=0.1,
+            trailing_stop_positive_offset=0.5,
+            trailing_only_offset_is_reached=True,  # activates trailing after +50% profit
+        )
+        result = backtest_strategy(
+            df=df,
+            fee_rate=0.001,  # 0.1% per side
+            starting_cash=starting_cash,
+            strategy=strat,
+            dca_step_pct=0.05,
+            dca_max_adds=10,
+        )
 
     # Output summary
     summ = result["summary"]
@@ -459,7 +801,8 @@ def main():
 
     # Save trades
     trades_df = pd.DataFrame(result["trades"])
-    trades_file_name = f"trades/{symbol.replace('/', '')}_{timeframe}_{start_dt_str}_{end_dt_str}.csv"
+    mode_suffix = "bearish" if market_mode == "bearish" else "bullish"
+    trades_file_name = f"trades/{symbol.replace('/', '')}_{timeframe}_{start_dt_str}_{end_dt_str}_{mode_suffix}.csv"
     parent = os.path.dirname(trades_file_name)
     if parent:
         os.makedirs(parent, exist_ok=True)
